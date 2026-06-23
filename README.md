@@ -20,8 +20,6 @@ with reset countdowns, threshold notifications, and an animated tray icon while 
 
 ## Screenshots
 
-> _Drop your images in `docs/` and they'll render here._
-
 | Usage | Settings | Analysis |
 | :---: | :---: | :---: |
 | ![Usage](docs/main.png) | ![Settings](docs/settings.png) | ![Analysis](docs/analytics.png) |
