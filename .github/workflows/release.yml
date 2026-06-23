@@ -10,7 +10,7 @@ on:
       - "v*"
   workflow_dispatch:
 
-# Needed so tauri-action can create/upload the GitHub Release.
+# Needed so the release step can create/upload the GitHub Release.
 permissions:
   contents: write
 
@@ -39,24 +39,36 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Build app & publish release
+      # Build only (no release here) — Tauri derives the installer name from
+      # productName, which contains spaces; we tidy it up in the next step.
+      - name: Build app
         uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          # When triggered by a tag, create a draft GitHub Release with the
-          # installer attached. On manual runs (no tag) this is empty, so the
-          # action only builds (no release) — the artifact upload below covers it.
-          tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
-          releaseName: ${{ github.ref_type == 'tag' && format('Claude Usage Widget {0}', github.ref_name) || '' }}
-          releaseBody: "Download the `*-setup.exe` below to install. Windows SmartScreen may warn about an unsigned app — choose *More info → Run anyway*."
-          releaseDraft: true
-          prerelease: false
+
+      # Tauri names the installer "Claude Usage Widget_<v>_x64-setup.exe".
+      # Strip the spaces so the file reads consistently: ClaudeUsageWidget_<v>_x64-setup.exe
+      - name: Tidy installer filename
+        shell: pwsh
+        run: |
+          $f = Get-ChildItem "src-tauri/target/release/bundle/nsis" -Filter "*-setup.exe" | Select-Object -First 1
+          if (-not $f) { throw "No NSIS installer found" }
+          $clean = $f.Name -replace ' ', ''
+          if ($clean -ne $f.Name) { Rename-Item -LiteralPath $f.FullName -NewName $clean }
+          Write-Host "Installer: $clean"
 
       - name: Upload installer artifact
-        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: claude-usage-widget-nsis
           path: src-tauri/target/release/bundle/nsis/*-setup.exe
           if-no-files-found: error
+
+      # Only when triggered by a version tag: publish a draft GitHub Release
+      # with the tidied installer attached.
+      - name: Publish draft release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          name: Claude Usage Widget ${{ github.ref_name }}
+          body: "Download the `*-setup.exe` below to install. Windows SmartScreen may warn about an unsigned app — choose *More info → Run anyway*."
+          files: src-tauri/target/release/bundle/nsis/*-setup.exe
