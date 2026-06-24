@@ -68,7 +68,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          draft: true
+          draft: false
           name: Claude Usage Widget ${{ github.ref_name }}
           body: "Download the `*-setup.exe` below to install. Windows SmartScreen may warn about an unsigned app — choose *More info → Run anyway*."
           files: src-tauri/target/release/bundle/nsis/*-setup.exe
