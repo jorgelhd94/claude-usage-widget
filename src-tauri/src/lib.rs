@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use notify::RecommendedWatcher;
 use sysinfo::System;
 use tauri::image::Image;
+use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -27,9 +28,10 @@ use watcher::Activity;
 pub struct AppState {
     pub http: reqwest::Client,
     pub version: String,
-    /// True when launched at boot via autostart (`--autostarted`): the process
-    /// stays resident and only hides the tray icon when Claude isn't running.
-    /// Otherwise (hook/manual launch) it exits shortly after Claude closes.
+    /// False only for hook-launched instances (`--hooked`), which exit shortly
+    /// after Claude Code closes so they clean up after themselves. Manual and
+    /// autostart launches are persistent: they stay resident with the tray icon
+    /// kept visible (and quittable) even while Claude Code isn't running.
     pub persistent: bool,
     pub usage: Mutex<UsageData>,
     pub settings: Mutex<Settings>,
@@ -53,7 +55,9 @@ pub struct AppState {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let (poke_tx, poke_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-    let persistent = std::env::args().any(|a| a == "--autostarted");
+    // Only the SessionStart hook launches with `--hooked`; those instances are
+    // ephemeral (exit when Claude Code closes). Manual / autostart stay resident.
+    let persistent = !std::env::args().any(|a| a == "--hooked");
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
@@ -116,9 +120,21 @@ pub fn run() {
                 let _ = handle.state::<AppState>().watcher.lock().unwrap().replace(w);
             }
 
+            // Right-click tray menu — lets a resident instance be closed
+            // (left-click still toggles the popup).
+            let quit_item = MenuItem::with_id(&handle, "quit", "Salir", true, None::<&str>)?;
+            let tray_menu = Menu::with_items(&handle, &[&quit_item])?;
+
             let tray = TrayIconBuilder::with_id("claude-usage")
                 .icon(icons::idle_icon(icons::NEUTRAL, 0.0))
                 .tooltip("Claude Usage")
+                .menu(&tray_menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| {
+                    if event.id.as_ref() == "quit" {
+                        app.exit(0);
+                    }
+                })
                 .on_tray_icon_event(|tray, event| {
                     let app = tray.app_handle();
                     tauri_plugin_positioner::on_tray_event(app, &event);
@@ -132,7 +148,9 @@ pub fn run() {
                     }
                 })
                 .build(&handle)?;
-            let _ = tray.set_visible(false);
+            // Resident instances show the tray immediately; hook-launched ones
+            // stay hidden until Claude Code is detected.
+            let _ = tray.set_visible(persistent);
             let _ = handle.state::<AppState>().tray.lock().unwrap().replace(tray);
 
             round_window_corners(&handle);
@@ -260,15 +278,24 @@ fn spawn_process_watcher(app: AppHandle) {
                     }
                 } else {
                     if was_running {
-                        set_tray_visible(&app, false);
                         let _ = app.emit("claude-status", false);
                         if let Some(w) = app.get_webview_window("main") {
                             let _ = w.hide();
                         }
+                        if state.persistent {
+                            // Stay resident & accessible: keep the tray visible
+                            // with a neutral icon while Claude Code is closed.
+                            set_tray_icon(&app, icons::idle_icon(icons::NEUTRAL, 0.0));
+                            set_tray_tooltip(&app, "Claude Code no está abierto".into());
+                        } else {
+                            set_tray_visible(&app, false);
+                        }
                     }
-                    misses += 1;
-                    if !state.persistent && misses >= 5 {
-                        app.exit(0);
+                    if !state.persistent {
+                        misses += 1;
+                        if misses >= 5 {
+                            app.exit(0);
+                        }
                     }
                 }
             }

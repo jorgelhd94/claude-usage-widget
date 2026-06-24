@@ -105,7 +105,7 @@ fn launch_command() -> Result<String, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let exe_str = exe.to_string_lossy().replace('\'', "''");
     Ok(format!(
-        "powershell -NoProfile -WindowStyle Hidden -Command \"Start-Process -FilePath '{}'\"",
+        "powershell -NoProfile -WindowStyle Hidden -Command \"Start-Process -FilePath '{}' -ArgumentList '--hooked'\"",
         exe_str
     ))
 }
