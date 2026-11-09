@@ -1,6 +1,6 @@
 [package]
 name = "claude-usage-widget"
-version = "0.1.1"
+version = "0.2.0"
 description = "Claude Code usage widget for the Windows system tray"
 authors = ["jorgelhd94"]
 license = "MIT"

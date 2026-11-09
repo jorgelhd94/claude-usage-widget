@@ -7,7 +7,8 @@ mod settings;
 mod usage;
 mod watcher;
 
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -21,8 +22,12 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use notifications::NotifyState;
 use settings::Settings;
-use usage::{Profile, UsageData, CLAUDE_VERSION_FALLBACK};
-use watcher::Activity;
+use usage::{FetchError, Profile, UsageData, CLAUDE_VERSION_FALLBACK};
+use watcher::{Activity, Presence};
+
+/// Poll cadence while no Claude app is open. Usage can still move (claude.ai
+/// in a browser, the phone app), just not fast enough to justify more.
+const IDLE_POLL_SECS: u64 = 900;
 
 /// Shared application state, managed by Tauri and reachable from commands/tasks.
 pub struct AppState {
@@ -35,7 +40,10 @@ pub struct AppState {
     pub persistent: bool,
     pub usage: Mutex<UsageData>,
     pub settings: Mutex<Settings>,
-    pub claude_running: AtomicBool,
+    /// Which Claude apps are open, as `Presence` bits.
+    pub presence: AtomicU8,
+    /// Claude Code login state carried between polls (see `credentials`).
+    pub auth: Arc<Mutex<credentials::AuthCache>>,
     pub working: AtomicBool,
     /// Epoch-ms when the popup was last hidden — used to make a tray click that
     /// just blurred-and-hid the popup count as "close", not immediately reopen.
@@ -47,9 +55,23 @@ pub struct AppState {
     pub frames: Mutex<Vec<Image<'static>>>,
     pub profile: Mutex<Option<Profile>>,
     pub analytics: Mutex<Option<analytics::Analytics>>,
-    pub watcher: Mutex<Option<RecommendedWatcher>>,
+    /// Filesystem watchers, held only to keep them alive.
+    pub watchers: Mutex<Vec<RecommendedWatcher>>,
     pub notify_state: Mutex<NotifyState>,
     pub poke: UnboundedSender<()>,
+}
+
+impl AppState {
+    pub fn presence(&self) -> Presence {
+        Presence::from_bits(self.presence.load(Ordering::Relaxed))
+    }
+}
+
+/// Payload of the `claude-status` event.
+#[derive(Clone, serde::Serialize)]
+struct ClaudeStatus {
+    running: bool,
+    source: &'static str,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -58,12 +80,19 @@ pub fn run() {
     // Only the SessionStart hook launches with `--hooked`; those instances are
     // ephemeral (exit when Claude Code closes). Manual / autostart stay resident.
     let persistent = !std::env::args().any(|a| a == "--hooked");
+    let by_hand = launched_by_hand(std::env::args());
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             // A second launch (e.g. the SessionStart hook firing again) just
-            // nudges the resident instance to refresh.
+            // nudges the resident instance to refresh. If it was the user
+            // opening the app, show them the popup: otherwise launching an
+            // already-running tray app looks like nothing happened.
             let _ = app.state::<AppState>().poke.send(());
+            if launched_by_hand(argv) {
+                let handle = app.clone();
+                let _ = app.run_on_main_thread(move || show_popup(&handle));
+            }
         }))
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_positioner::init())
@@ -83,6 +112,7 @@ pub fn run() {
             commands::remove_session_hook,
             commands::get_analytics,
             commands::resize_popup,
+            commands::start_login,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -101,7 +131,8 @@ pub fn run() {
                 persistent,
                 usage: Mutex::new(UsageData::default()),
                 settings: Mutex::new(loaded),
-                claude_running: AtomicBool::new(false),
+                presence: AtomicU8::new(0),
+                auth: Arc::new(Mutex::new(credentials::AuthCache::default())),
                 working: AtomicBool::new(false),
                 last_hidden_ms: AtomicI64::new(0),
                 activity: activity.clone(),
@@ -111,13 +142,16 @@ pub fn run() {
                 frames: Mutex::new(icons::working_frames(icons::NEUTRAL, 0.0)),
                 profile: Mutex::new(None),
                 analytics: Mutex::new(None),
-                watcher: Mutex::new(None),
+                watchers: Mutex::new(Vec::new()),
                 notify_state: Mutex::new(NotifyState::default()),
                 poke: poke_tx.clone(),
             });
 
-            if let Some(w) = watcher::start_activity_watcher(activity) {
-                let _ = handle.state::<AppState>().watcher.lock().unwrap().replace(w);
+            {
+                let state = handle.state::<AppState>();
+                let mut watchers = state.watchers.lock().unwrap();
+                watchers.extend(watcher::start_activity_watcher(activity));
+                watchers.extend(watcher::start_credentials_watcher(poke_tx.clone()));
             }
 
             // Right-click tray menu — lets a resident instance be closed
@@ -149,7 +183,7 @@ pub fn run() {
                 })
                 .build(&handle)?;
             // Resident instances show the tray immediately; hook-launched ones
-            // stay hidden until Claude Code is detected.
+            // stay hidden until a Claude app is detected.
             let _ = tray.set_visible(persistent);
             let _ = handle.state::<AppState>().tray.lock().unwrap().replace(tray);
 
@@ -158,6 +192,16 @@ pub fn run() {
             spawn_process_watcher(handle.clone());
             spawn_poll_task(handle.clone(), poke_rx);
             spawn_anim_task(handle.clone());
+
+            if by_hand {
+                // Give the webview a moment to paint before revealing it.
+                let handle = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(700)).await;
+                    let h = handle.clone();
+                    let _ = handle.run_on_main_thread(move || show_popup(&h));
+                });
+            }
 
             Ok(())
         })
@@ -225,13 +269,27 @@ fn toggle_popup(app: &AppHandle) {
             if since < 300 {
                 return;
             }
-            // Show first: a hidden window has no associated monitor, so
-            // current_monitor() would be None and positioning a no-op.
-            let _ = win.show();
-            position_bottom_right(&win);
-            let _ = win.set_focus();
+            show_popup(app);
         }
     }
+}
+
+fn show_popup(app: &AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        // Show first: a hidden window has no associated monitor, so
+        // current_monitor() would be None and positioning a no-op.
+        let _ = win.show();
+        position_bottom_right(&win);
+        let _ = win.set_focus();
+    }
+}
+
+/// True when the user started the app themselves, as opposed to the
+/// SessionStart hook (`--hooked`) or Windows autostart (`--autostarted`).
+fn launched_by_hand<I: IntoIterator<Item = String>>(args: I) -> bool {
+    !args
+        .into_iter()
+        .any(|a| a == "--hooked" || a == "--autostarted")
 }
 
 /// Anchor the popup to the bottom-right of the monitor, just above the taskbar.
@@ -262,44 +320,44 @@ pub(crate) fn position_bottom_right(win: &tauri::WebviewWindow) {
 fn spawn_process_watcher(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let mut sys = System::new();
-        let mut was_running = false;
+        let mut last: Option<Presence> = None;
         let mut misses: u32 = 0;
         loop {
-            let running = watcher::claude_running(&mut sys);
+            let now = watcher::claude_presence(&mut sys);
+            let was_running = last.is_some_and(|p| p.any());
             {
                 let state = app.state::<AppState>();
-                state.claude_running.store(running, Ordering::Relaxed);
-                if running {
+                state.presence.store(now.bits(), Ordering::Relaxed);
+                if last != Some(now) {
+                    let _ = app.emit(
+                        "claude-status",
+                        ClaudeStatus {
+                            running: now.any(),
+                            source: now.source(),
+                        },
+                    );
+                }
+                if now.any() {
                     misses = 0;
                     if !was_running {
                         set_tray_visible(&app, true);
                         let _ = state.poke.send(());
-                        let _ = app.emit("claude-status", true);
                     }
-                } else {
+                } else if !state.persistent {
+                    // Hook-launched instances only live while Claude is open.
                     if was_running {
-                        let _ = app.emit("claude-status", false);
                         if let Some(w) = app.get_webview_window("main") {
                             let _ = w.hide();
                         }
-                        if state.persistent {
-                            // Stay resident & accessible: keep the tray visible
-                            // with a neutral icon while Claude Code is closed.
-                            set_tray_icon(&app, icons::idle_icon(icons::NEUTRAL, 0.0));
-                            set_tray_tooltip(&app, "Claude Code no está abierto".into());
-                        } else {
-                            set_tray_visible(&app, false);
-                        }
+                        set_tray_visible(&app, false);
                     }
-                    if !state.persistent {
-                        misses += 1;
-                        if misses >= 5 {
-                            app.exit(0);
-                        }
+                    misses += 1;
+                    if misses >= 5 {
+                        app.exit(0);
                     }
                 }
             }
-            was_running = running;
+            last = Some(now);
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
     });
@@ -309,48 +367,90 @@ fn spawn_poll_task(app: AppHandle, mut poke_rx: UnboundedReceiver<()>) {
     tauri::async_runtime::spawn(async move {
         let mut backoff_until: Option<Instant> = None;
         loop {
-            let (running, interval, http, version) = {
+            let (running, persistent, interval, keep_alive, http, version, auth_cache) = {
                 let state = app.state::<AppState>();
-                let running = state.claude_running.load(Ordering::Relaxed);
-                let interval = state.settings.lock().unwrap().poll_interval_secs.max(30);
-                let http = state.http.clone();
-                let version = state.version.clone();
-                (running, interval, http, version)
+                let settings = state.settings.lock().unwrap();
+                (
+                    state.presence().any(),
+                    state.persistent,
+                    settings.poll_interval_secs.max(30),
+                    settings.keep_session_alive,
+                    state.http.clone(),
+                    state.version.clone(),
+                    state.auth.clone(),
+                )
             };
 
+            // The limits are shared by every Claude surface, so a resident
+            // instance keeps polling with nothing open. The request needs only
+            // the login on disk, not a running Claude Code.
+            let active = running || persistent;
             let in_backoff = backoff_until.map(|t| Instant::now() < t).unwrap_or(false);
 
-            if running {
-                let need_profile = app.state::<AppState>().profile.lock().unwrap().is_none();
-                if need_profile {
-                    if let Ok(p) = usage::fetch_profile(&http, &version).await {
-                        *app.state::<AppState>().profile.lock().unwrap() = Some(p.clone());
-                        let _ = app.emit("profile-updated", p);
-                    }
-                }
-            }
-
-            if running && !in_backoff {
-                match usage::fetch_usage(&http, &version).await {
+            if active && !in_backoff {
+                let auth = usage::Auth {
+                    cache: &auth_cache,
+                    allow_refresh: keep_alive,
+                };
+                match usage::fetch_usage(&http, &version, &auth).await {
                     Ok(data) => {
                         backoff_until = None;
                         on_usage_update(&app, data);
+                        let need_profile =
+                            app.state::<AppState>().profile.lock().unwrap().is_none();
+                        if need_profile {
+                            if let Ok(p) = usage::fetch_profile(&http, &version, &auth).await {
+                                *app.state::<AppState>().profile.lock().unwrap() = Some(p.clone());
+                                let _ = app.emit("profile-updated", Some(p));
+                            }
+                        }
                     }
-                    Err(usage::FetchError::RateLimited(retry)) => {
+                    Err(FetchError::RateLimited(retry)) => {
                         let secs = retry.unwrap_or(60).clamp(30, 600);
                         backoff_until = Some(Instant::now() + Duration::from_secs(secs));
-                        emit_error(&app, "Límite de peticiones (429) — reintentando");
+                        on_fetch_error(&app, &FetchError::RateLimited(retry));
                     }
-                    Err(e) => emit_error(&app, &e.user_message()),
+                    Err(e) => on_fetch_error(&app, &e),
                 }
             }
 
+            let mut wait = if running {
+                interval
+            } else {
+                interval.max(IDLE_POLL_SECS)
+            };
+            // Wake just after the next window resets so its bar drops promptly.
+            if let Some(secs) = secs_until_next_reset(&app) {
+                wait = wait.min((secs + 5).max(30));
+            }
+
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(interval)) => {}
-                _ = poke_rx.recv() => {}
+                _ = tokio::time::sleep(Duration::from_secs(wait)) => {}
+                _ = poke_rx.recv() => {
+                    // Pokes come in bursts (one file save is several fs events);
+                    // let the burst, and the write behind it, finish.
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    while poke_rx.try_recv().is_ok() {}
+                }
             }
         }
     });
+}
+
+/// Seconds until the soonest upcoming window reset, if any is known.
+fn secs_until_next_reset(app: &AppHandle) -> Option<u64> {
+    let now = credentials::now_ms();
+    let state = app.state::<AppState>();
+    let usage = state.usage.lock().unwrap();
+    usage
+        .limits
+        .iter()
+        .filter_map(|l| l.resets_at.as_deref())
+        .filter_map(|iso| chrono::DateTime::parse_from_rfc3339(iso).ok())
+        .map(|t| t.timestamp_millis() - now)
+        .filter(|ms| *ms > 0)
+        .min()
+        .map(|ms| (ms / 1000) as u64)
 }
 
 fn spawn_anim_task(app: AppHandle) {
@@ -360,7 +460,7 @@ fn spawn_anim_task(app: AppHandle) {
             let working = {
                 let state = app.state::<AppState>();
                 let anim = state.settings.lock().unwrap().enable_animation;
-                let running = state.claude_running.load(Ordering::Relaxed);
+                let running = state.presence().any();
                 let active = state
                     .activity
                     .lock()
@@ -445,13 +545,48 @@ fn on_usage_update(app: &AppHandle, data: UsageData) {
     let _ = app.emit("usage-updated", data);
 }
 
-fn emit_error(app: &AppHandle, msg: &str) {
-    let data = {
-        let state = app.state::<AppState>();
+fn on_fetch_error(app: &AppHandle, err: &FetchError) {
+    let needs_login = err.needs_login();
+    let state = app.state::<AppState>();
+    let (data, newly_signed_out) = {
         let mut u = state.usage.lock().unwrap();
-        u.error = Some(msg.to_string());
-        u.clone()
+        let newly = needs_login && !u.needs_login;
+        u.error = Some(err.user_message());
+        u.needs_login = needs_login;
+        if needs_login {
+            // What we were showing belongs to a login that is gone.
+            u.limits.clear();
+        }
+        (u.clone(), newly)
     };
+
+    if newly_signed_out {
+        *state.icon_color.lock().unwrap() = icons::SIGNED_OUT.to_string();
+        *state.icon_percent.lock().unwrap() = 0.0;
+        *state.frames.lock().unwrap() = icons::working_frames(icons::SIGNED_OUT, 0.0);
+        if !state.working.load(Ordering::Relaxed) {
+            set_tray_icon(app, icons::idle_icon(icons::SIGNED_OUT, 0.0));
+        }
+        set_tray_tooltip(app, "Claude Usage — inicia sesión en Claude Code".into());
+
+        // The account may differ after signing back in; refetch it then.
+        *state.profile.lock().unwrap() = None;
+        let _ = app.emit("profile-updated", None::<Profile>);
+
+        // Only worth a toast if it stopped working mid-run; at startup the
+        // popup already says so.
+        let notify = state.settings.lock().unwrap().enable_notifications;
+        if notify && data.fetched_at_ms > 0 {
+            use tauri_plugin_notification::NotificationExt;
+            let _ = app
+                .notification()
+                .builder()
+                .title("Claude Usage — sesión caducada")
+                .body("Abre el widget para volver a iniciar sesión en Claude Code.")
+                .show();
+        }
+    }
+
     let _ = app.emit("usage-updated", data);
 }
 
@@ -503,24 +638,125 @@ fn round_window_corners(app: &AppHandle) {
 #[cfg(not(target_os = "windows"))]
 fn round_window_corners(_app: &AppHandle) {}
 
-fn detect_version() -> String {
+/// Parse a leading `major.minor.patch` out of a directory name.
+fn parse_version(name: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = name.splitn(3, '.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch: String = parts.next()?.chars().take_while(|c| c.is_ascii_digit()).collect();
+    Some((major, minor, patch.parse().ok()?))
+}
+
+fn subdirs(dir: PathBuf) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect())
+        .unwrap_or_default()
+}
+
+/// Every Claude Code version installed on this machine, newest first, with
+/// the directory it lives in: the native CLI install, the engines Claude
+/// Desktop downloads for its Code sessions, and the VS Code extension.
+pub(crate) fn installed_claude_code() -> Vec<((u32, u32, u32), PathBuf)> {
+    let mut roots = Vec::new();
     if let Some(home) = dirs::home_dir() {
-        let ext = home.join(".vscode").join("extensions");
-        if let Ok(entries) = std::fs::read_dir(&ext) {
-            let mut best: Option<String> = None;
-            for e in entries.flatten() {
-                let name = e.file_name().to_string_lossy().to_string();
-                if let Some(rest) = name.strip_prefix("anthropic.claude-code-") {
-                    let ver = rest.split('-').next().unwrap_or("").to_string();
-                    if !ver.is_empty() {
-                        best = Some(ver);
-                    }
+        roots.push(home.join(".local").join("share").join("claude").join("versions"));
+    }
+    if let Some(local) = dirs::data_local_dir() {
+        // Store/MSIX Desktop: %LOCALAPPDATA%/Claude-Data/<package>/claude-code/<version>
+        for pkg in subdirs(local.join("Claude-Data")) {
+            roots.push(pkg.join("claude-code"));
+        }
+    }
+    if let Some(roaming) = dirs::data_dir() {
+        roots.push(roaming.join("Claude").join("claude-code"));
+    }
+
+    let mut found = Vec::new();
+    for root in roots {
+        if let Ok(rd) = std::fs::read_dir(&root) {
+            for e in rd.flatten() {
+                if let Some(v) = parse_version(&e.file_name().to_string_lossy()) {
+                    found.push((v, e.path()));
                 }
-            }
-            if let Some(v) = best {
-                return v;
             }
         }
     }
-    CLAUDE_VERSION_FALLBACK.to_string()
+    if let Some(home) = dirs::home_dir() {
+        for ext in subdirs(home.join(".vscode").join("extensions")) {
+            let name = ext.file_name().unwrap_or_default().to_string_lossy().to_string();
+            if let Some(v) = name.strip_prefix("anthropic.claude-code-").and_then(parse_version) {
+                found.push((v, ext));
+            }
+        }
+    }
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found
+}
+
+/// Newest installed Claude Code version, for the User-Agent header.
+fn detect_version() -> String {
+    match installed_claude_code().first() {
+        Some(((a, b, c), _)) => format!("{}.{}.{}", a, b, c),
+        None => CLAUDE_VERSION_FALLBACK.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_version_directory_names() {
+        assert_eq!(parse_version("2.1.317"), Some((2, 1, 317)));
+        assert_eq!(parse_version("2.1.185-win32-x64"), Some((2, 1, 185)));
+        assert_eq!(parse_version("latest"), None);
+        assert_eq!(parse_version("2.1"), None);
+        assert!(parse_version("2.1.317") > parse_version("2.1.99"));
+    }
+
+    #[test]
+    fn hook_and_autostart_launches_are_not_by_hand() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(launched_by_hand(args(&["widget.exe"])));
+        assert!(!launched_by_hand(args(&["widget.exe", "--hooked"])));
+        assert!(!launched_by_hand(args(&["widget.exe", "--autostarted"])));
+    }
+
+    /// Not a pass/fail test: prints what the widget sees on this machine, for
+    /// when "it shows nothing" needs explaining. Makes the real usage request
+    /// but never renews the token, and prints no secrets.
+    /// `cargo test live_diagnostics -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_diagnostics() {
+        let presence = watcher::claude_presence(&mut System::new());
+        println!("presence: {:?} -> source {:?}", presence, presence.source());
+        let version = detect_version();
+        println!("version for the User-Agent: {}", version);
+        match credentials::read_credentials() {
+            Ok(c) => println!(
+                "login on disk: expires_at_ms={} refreshable={}",
+                c.expires_at_ms,
+                c.can_refresh(credentials::now_ms())
+            ),
+            Err(e) => println!("login on disk: {}", e),
+        }
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let http = reqwest::Client::new();
+        let cache = Mutex::new(credentials::AuthCache::default());
+        let auth = usage::Auth {
+            cache: &cache,
+            allow_refresh: false,
+        };
+        match rt.block_on(usage::fetch_usage(&http, &version, &auth)) {
+            Ok(u) => println!("usage: {} limits, highest {:.0}%", u.limits.len(), u.max_percent()),
+            Err(e) => println!(
+                "usage: {:?} -> needs_login={} message={:?}",
+                e,
+                e.needs_login(),
+                e.user_message()
+            ),
+        }
+    }
 }

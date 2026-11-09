@@ -1,7 +1,7 @@
 {
   "name": "claude-usage-widget",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "A Windows 11 system-tray widget that shows your Claude Code usage, built with Tauri.",
   "license": "MIT",
   "author": "jorgelhd94",

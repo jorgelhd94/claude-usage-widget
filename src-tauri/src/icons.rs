@@ -11,6 +11,8 @@ pub const ICON_SIZE: u32 = 64;
 pub const FRAME_COUNT: usize = 12;
 /// Neutral fill for the initial icon before the first usage fetch.
 pub const NEUTRAL: &str = CLAY;
+/// Badge color while there is no usable Claude Code login: grey, "no signal".
+pub const SIGNED_OUT: &str = "#8A857C";
 
 /// Status-badge color by utilization: clay (normal) → amber (high) → red (critical).
 pub fn color_for_percent(p: f64) -> &'static str {

@@ -5,7 +5,10 @@ use tauri_plugin_store::StoreExt;
 const STORE_FILE: &str = "settings.json";
 const KEY: &str = "settings";
 
+// `default`: settings saved by an older version lack the newer fields; fill
+// those in rather than discarding everything the user had configured.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
     /// Usage poll cadence in seconds (clamped to >= 30 to respect rate limits).
     pub poll_interval_secs: u64,
@@ -18,6 +21,10 @@ pub struct Settings {
     pub start_with_windows: bool,
     /// "dark" | "light" | "auto"
     pub theme: String,
+    /// Renew Claude Code's OAuth token from the widget once it expires. Needed
+    /// when nothing else does: Claude Desktop signs in on its own and never
+    /// touches the CLI's login, which otherwise lapses from disuse.
+    pub keep_session_alive: bool,
 }
 
 impl Default for Settings {
@@ -30,6 +37,7 @@ impl Default for Settings {
             enable_animation: true,
             start_with_windows: false,
             theme: "dark".to_string(),
+            keep_session_alive: true,
         }
     }
 }
