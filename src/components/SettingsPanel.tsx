@@ -99,6 +99,16 @@ export function SettingsPanel({
         <Toggle on={hookInstalled} onClick={() => onToggleHook(!hookInstalled)} />
       </Row>
 
+      <Row
+        label="Mantener la sesión activa"
+        desc="Renueva el login si solo usas Claude Desktop"
+      >
+        <Toggle
+          on={settings.keep_session_alive}
+          onClick={() => set({ keep_session_alive: !settings.keep_session_alive })}
+        />
+      </Row>
+
       <Row label="Iniciar con Windows" desc="Vigila en segundo plano">
         <Toggle
           on={settings.start_with_windows}

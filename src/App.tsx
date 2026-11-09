@@ -2,9 +2,18 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
-import type { Analytics, Profile, Settings, StateSnapshot, UsageData } from "./types";
+import type {
+  Analytics,
+  ClaudeSource,
+  ClaudeStatus,
+  Profile,
+  Settings,
+  StateSnapshot,
+  UsageData,
+} from "./types";
 import { timeSince } from "./lib/format";
 import { ClaudeLogo } from "./components/ClaudeLogo";
+import { LoginCard } from "./components/LoginCard";
 import { UsageBar } from "./components/UsageBar";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { AnalyticsView } from "./components/AnalyticsView";
@@ -19,13 +28,14 @@ const DEFAULT_SETTINGS: Settings = {
   enable_animation: true,
   start_with_windows: false,
   theme: "dark",
+  keep_session_alive: true,
 };
 
 export default function App() {
   const [usage, setUsage] = useState<UsageData | null>(null);
   const [profile, setProfile] = useState<Profile | null>(null);
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
-  const [claudeRunning, setClaudeRunning] = useState(false);
+  const [claudeSource, setClaudeSource] = useState<ClaudeSource>("");
   const [working, setWorking] = useState(false);
   const [hookInstalled, setHookInstalled] = useState(false);
   const [view, setView] = useState<"main" | "settings" | "analytics">("main");
@@ -39,15 +49,17 @@ export default function App() {
         setUsage(s.usage);
         setProfile(s.profile);
         setSettings(s.settings);
-        setClaudeRunning(s.claude_running);
+        setClaudeSource(s.claude_source);
         setWorking(s.working);
       })
       .catch(() => {});
     invoke<boolean>("session_hook_installed").then(setHookInstalled).catch(() => {});
 
     const unUsage = listen<UsageData>("usage-updated", (e) => setUsage(e.payload));
-    const unProfile = listen<Profile>("profile-updated", (e) => setProfile(e.payload));
-    const unStatus = listen<boolean>("claude-status", (e) => setClaudeRunning(e.payload));
+    const unProfile = listen<Profile | null>("profile-updated", (e) => setProfile(e.payload));
+    const unStatus = listen<ClaudeStatus>("claude-status", (e) =>
+      setClaudeSource(e.payload.source),
+    );
     const unWorking = listen<boolean>("working-status", (e) => setWorking(e.payload));
 
     return () => {
@@ -103,7 +115,15 @@ export default function App() {
   };
 
   const planName = profile?.plan || usage?.plan || "Claude";
-  const status = working ? "trabajando…" : claudeRunning ? "activo" : "inactivo";
+  const claudeRunning = claudeSource !== "";
+  const status = working
+    ? "trabajando…"
+    : claudeSource === "code"
+      ? "activo"
+      : claudeSource === "desktop"
+        ? "Claude Desktop abierto"
+        : "inactivo";
+  const needsLogin = !!usage?.needs_login;
   const errMsg = usage?.error ?? null;
   // 429 / rate-limit is transient and expected — show it subtly, not as an alarm.
   const isTransient = !!errMsg && /429|límite de peticiones/i.test(errMsg);
@@ -217,23 +237,28 @@ export default function App() {
           <AnalyticsView analytics={analytics} />
         ) : (
           <div className="flex flex-col gap-4">
-            {errMsg && !isTransient && (
-              <div className="rounded-lg border border-[#D9A05B]/30 bg-[#D9A05B]/10 px-3 py-2 text-[13px] text-[#E0A458]">
-                {errMsg}
-              </div>
+            {needsLogin ? (
+              <LoginCard reason={errMsg} />
+            ) : (
+              errMsg &&
+              !isTransient && (
+                <div className="rounded-lg border border-[#D9A05B]/30 bg-[#D9A05B]/10 px-3 py-2 text-[13px] text-[#E0A458]">
+                  {errMsg}
+                </div>
+              )
             )}
 
-            {!usage || usage.limits.length === 0 ? (
-              <div className="py-10 text-center text-[14px] text-[#9B968D]">
-                {claudeRunning
-                  ? "Cargando uso…"
-                  : "Abre Claude Code para ver el uso"}
-              </div>
-            ) : (
-              usage.limits.map((l) => (
-                <UsageBar key={l.kind + l.label} limit={l} now={now} />
-              ))
-            )}
+            {usage && usage.limits.length > 0
+              ? usage.limits.map((l) => (
+                  <UsageBar key={l.kind + l.label} limit={l} now={now} />
+                ))
+              : // An error shown above already explains the empty space; a
+                // rate-limit isn't shown there, it just means "not yet".
+                (!errMsg || isTransient) && (
+                  <div className="py-10 text-center text-[14px] text-[#9B968D]">
+                    Cargando uso…
+                  </div>
+                )}
 
             {usage?.extra_usage_enabled && (
               <div className="flex items-center justify-between rounded-lg bg-white/[0.05] px-3 py-2 text-[13px]">

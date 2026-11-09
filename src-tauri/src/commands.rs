@@ -17,17 +17,112 @@ pub struct StateSnapshot {
     pub settings: Settings,
     pub profile: Option<Profile>,
     pub claude_running: bool,
+    /// Which Claude app is open: "code", "desktop" or "".
+    pub claude_source: &'static str,
     pub working: bool,
 }
 
 #[tauri::command]
 pub fn get_state(state: State<AppState>) -> StateSnapshot {
+    let presence = state.presence();
     StateSnapshot {
         usage: state.usage.lock().unwrap().clone(),
         settings: state.settings.lock().unwrap().clone(),
         profile: state.profile.lock().unwrap().clone(),
-        claude_running: state.claude_running.load(Ordering::Relaxed),
+        claude_running: presence.any(),
+        claude_source: presence.source(),
         working: state.working.load(Ordering::Relaxed),
+    }
+}
+
+// ---- Signing in to Claude Code ---------------------------------------------
+
+/// Find a Claude Code executable to sign in with: the CLI on PATH or in its
+/// default install location, else the newest engine Claude Desktop downloaded
+/// (the same binary — which is what lets Desktop-only users sign in at all).
+fn find_claude_cli() -> Option<PathBuf> {
+    let names: &[&str] = if cfg!(windows) {
+        &["claude.exe", "claude.cmd"]
+    } else {
+        &["claude"]
+    };
+    let mut dirs_to_try: Vec<PathBuf> = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        dirs_to_try.push(home.join(".local").join("bin"));
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        dirs_to_try.extend(std::env::split_paths(&path));
+    }
+    for dir in dirs_to_try {
+        for name in names {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    // Desktop keeps each engine at claude-code/<version>/<build>/claude.exe.
+    for (_, dir) in crate::installed_claude_code() {
+        let mut level = vec![dir];
+        for _ in 0..2 {
+            for d in &level {
+                let candidate = d.join(names[0]);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+            level = level
+                .iter()
+                .flat_map(|d| std::fs::read_dir(d).into_iter().flatten().flatten())
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect();
+        }
+    }
+    None
+}
+
+/// Open a terminal running `claude auth login`. Claude Code does the whole
+/// OAuth flow itself (browser and all) and writes the result to its
+/// credentials file, which the widget is watching — so the popup comes back to
+/// life as soon as the user finishes, and the widget never handles a sign-in.
+#[tauri::command]
+pub fn start_login() -> Result<(), String> {
+    let cli = find_claude_cli().ok_or_else(|| {
+        "No se encontró Claude Code. Instálalo y ejecuta «claude auth login».".to_string()
+    })?;
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+        // `cmd /k` keeps the window open afterwards, so a failed login can be read.
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.arg("/k").arg(&cli).args(["auth", "login"]);
+        // If a Claude session launched us (the SessionStart hook), we carry its
+        // environment; a login run with it would act as that embedded session
+        // rather than as the user's own CLI.
+        for (key, _) in std::env::vars_os() {
+            let k = key.to_string_lossy().to_uppercase();
+            let inherited = k == "CLAUDECODE"
+                || k == "CLAUDE_PID"
+                || k.starts_with("CLAUDE_CODE_")
+                || k.starts_with("CLAUDE_AGENT_SDK_")
+                || k.starts_with("ANTHROPIC_");
+            if inherited {
+                cmd.env_remove(&key);
+            }
+        }
+        cmd.creation_flags(CREATE_NEW_CONSOLE)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("No se pudo abrir la terminal: {}", e))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cli;
+        Err("Ejecuta «claude auth login» en una terminal.".to_string())
     }
 }
 

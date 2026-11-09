@@ -6,14 +6,9 @@ export function colorFor(percent: number): string {
   return "#D97757"; // clay
 }
 
-/** Human countdown until an ISO-8601 reset timestamp. */
-export function timeUntil(iso: string | null, now: number): string {
-  if (!iso) return "";
-  const target = new Date(iso).getTime();
-  if (isNaN(target)) return "";
-  let secs = Math.floor((target - now) / 1000);
-  if (secs <= 0) return "reiniciando…";
-
+/** A positive span of seconds as "2d 3h" / "4h 10m" / "12m" / "<1m". */
+export function formatSpan(totalSecs: number): string {
+  let secs = Math.floor(totalSecs);
   const d = Math.floor(secs / 86400);
   secs -= d * 86400;
   const h = Math.floor(secs / 3600);
@@ -24,6 +19,47 @@ export function timeUntil(iso: string | null, now: number): string {
   if (h > 0) return `${h}h ${m}m`;
   if (m > 0) return `${m}m`;
   return "<1m";
+}
+
+/** Human countdown until an ISO-8601 reset timestamp. */
+export function timeUntil(iso: string | null, now: number): string {
+  if (!iso) return "";
+  const target = new Date(iso).getTime();
+  if (isNaN(target)) return "";
+  const secs = Math.floor((target - now) / 1000);
+  if (secs <= 0) return "reiniciando…";
+  return formatSpan(secs);
+}
+
+export interface Pace {
+  /** Share of the window already gone, 0–1: where "on pace" sits on the bar. */
+  elapsed: number;
+  /** Set only when, at the average rate so far, the limit runs out before the
+   *  window resets: milliseconds from now until it does. */
+  exhaustsInMs: number | null;
+}
+
+/** Where a usage window stands against the clock, or null when its length or
+ *  reset time is unknown. */
+export function paceOf(
+  limit: { percent: number; resets_at: string | null; window_secs: number | null },
+  now: number,
+): Pace | null {
+  if (!limit.window_secs || !limit.resets_at) return null;
+  const target = new Date(limit.resets_at).getTime();
+  if (isNaN(target)) return null;
+  const windowMs = limit.window_secs * 1000;
+  const remainingMs = target - now;
+  const elapsedMs = windowMs - remainingMs;
+  if (elapsedMs <= 0 || remainingMs <= 0) return null;
+
+  let exhaustsInMs: number | null = null;
+  // Early in a window, or with little used, the average rate is just noise.
+  if (elapsedMs / windowMs >= 0.05 && limit.percent >= 10 && limit.percent < 100) {
+    const toFullMs = ((100 - limit.percent) * elapsedMs) / limit.percent;
+    if (toFullMs < remainingMs) exhaustsInMs = toFullMs;
+  }
+  return { elapsed: elapsedMs / windowMs, exhaustsInMs };
 }
 
 /** Absolute reset time, e.g. "vie 22:59" (this week) or "27 jun" (further out). */

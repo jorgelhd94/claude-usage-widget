@@ -5,6 +5,8 @@ export interface LimitInfo {
   severity: string;
   resets_at: string | null;
   is_active: boolean;
+  /** Length of the window (5h / 7d) in seconds, when known. */
+  window_secs: number | null;
 }
 
 export interface UsageData {
@@ -15,6 +17,8 @@ export interface UsageData {
   extra_monthly_limit: number | null;
   fetched_at_ms: number;
   error: string | null;
+  /** The Claude Code login is missing or dead; only signing in again fixes it. */
+  needs_login: boolean;
 }
 
 export interface Profile {
@@ -34,6 +38,15 @@ export interface Settings {
   enable_animation: boolean;
   start_with_windows: boolean;
   theme: string;
+  keep_session_alive: boolean;
+}
+
+/** Which Claude app is open: a Claude Code engine, only the Desktop app, or none. */
+export type ClaudeSource = "code" | "desktop" | "";
+
+export interface ClaudeStatus {
+  running: boolean;
+  source: ClaudeSource;
 }
 
 export interface StateSnapshot {
@@ -41,6 +54,7 @@ export interface StateSnapshot {
   settings: Settings;
   profile: Profile | null;
   claude_running: boolean;
+  claude_source: ClaudeSource;
   working: boolean;
 }
 

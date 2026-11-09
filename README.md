@@ -30,8 +30,15 @@ with reset countdowns, threshold notifications, and an animated tray icon while 
 
 - **Live usage at a glance** — Session (5h), Weekly (7d) and per-model (Sonnet/Opus) limits, each with a
   progress bar, percentage and a "resets in…" countdown — the same numbers as Claude Code's `/usage`.
-- **Tray-only, on-demand** — the icon appears **only while Claude Code is running** and disappears when you
-  close it. No taskbar clutter.
+- **Pace at a glance** — a tick on each bar marks how much of the window has elapsed, so a fill running
+  ahead of the tick means you're spending faster than the clock; when the current rate would exhaust the
+  limit before it resets, the bar says how long you have left.
+- **Works however you use Claude** — the Claude Code CLI, the IDE extensions, and the **Claude Desktop
+  app** (including its Code sessions) all draw on the same limits and are all detected. See
+  [Using it with Claude Desktop](#using-it-with-claude-desktop).
+- **Tray-only, on-demand** — launched by the hook, the icon appears **only while Claude is running** and
+  disappears when you close it. Launched by hand or with Windows, it stays in the tray and keeps the
+  numbers fresh. No taskbar clutter.
 - **Color-coded icon** — the Claude mark gets a status badge that turns amber/red as you approach your
   configurable thresholds, so you can read your usage without even opening the popup.
 - **Working animation** — the icon animates while Claude is actively working (detected from local session
@@ -55,11 +62,20 @@ uses for its `/usage` panel:
 - `GET https://api.anthropic.com/api/oauth/usage` — limits & reset times
 - `GET https://api.anthropic.com/api/oauth/profile` — plan & account info
 
-Because the widget only lives while Claude Code is open, your token is kept fresh by Claude Code in the
-background — no separate login or OAuth refresh is implemented here.
+While the Claude Code CLI is in use it keeps that token fresh by itself. When it isn't — typically because
+you work in Claude Desktop, which signs in separately and never touches the CLI's login — the widget renews
+the token once it has expired, through the same OAuth endpoint Claude Code uses
+(`POST https://platform.claude.com/v1/oauth/token`), and writes the result back to
+`~/.claude/.credentials.json` so the CLI stays logged in too. Only the token fields are touched; the rest of
+the file is preserved. You can turn this off in Settings (**Keep the session alive**).
 
-- **Presence** — the backend polls the process list (`sysinfo`) to show/hide the tray icon based on whether
-  Claude Code is running.
+The widget never signs you in itself. If there is no usable login, the popup offers a button that opens a
+terminal running `claude auth login`; Claude Code does the rest and the widget picks the new login up from
+the file.
+
+- **Presence** — the backend polls the process list (`sysinfo`) for Claude Code engines and the Claude
+  Desktop app. Hook-launched instances use it to show/hide the tray icon and exit; resident ones only use
+  it to poll less often when nothing is open.
 - **"Working" state** — a filesystem watcher (`notify`) on `~/.claude/projects/**/*.jsonl` detects active
   session writes to drive the icon animation.
 - **Analysis** — usage attribution is computed locally by parsing your own session transcript `.jsonl`
@@ -70,15 +86,16 @@ background — no separate login or OAuth refresh is implemented here.
 
 - **100% local + first-party.** The only network calls are to Anthropic's official API, authenticated with
   **your own** token. There are no third-party servers, no analytics, and no telemetry.
-- Your credentials are read from disk only to make those requests; they are never stored, logged, or
-  transmitted anywhere else.
+- Your credentials are read from disk only to make those requests; they are never logged or transmitted
+  anywhere else. The only thing written is the renewed token, back into Claude Code's own credentials file.
 - The source is here for you to verify — see [`src-tauri/src/`](src-tauri/src/).
 
 ## Requirements
 
 - **Windows 11** (also expected to work on Windows 10 22H2+).
 - **WebView2** runtime — preinstalled on Windows 11.
-- **Claude Code** installed and logged in (the widget reads its local credentials).
+- **Claude Code** logged in (the widget reads its local credentials). The CLI works, and so does the
+  Claude Code engine that Claude Desktop downloads for its Code sessions — you don't need both.
 
 ## Install
 
@@ -95,12 +112,26 @@ background — no separate login or OAuth refresh is implemented here.
 - **Left-click the tray icon** to open the popup; click it again (or click away) to close it.
 - **Settings** (⚙️):
   - **Show when Claude Code opens** — installs/removes a `SessionStart` hook in `~/.claude/settings.json`.
+  - **Keep the session alive** — lets the widget renew Claude Code's token when it expires (on by default;
+    needed if you only use Claude Desktop).
   - **Start with Windows** — registers an autostart entry (off by default; the hook usually covers it).
   - **Notifications** — toggle threshold toasts.
   - **Animate icon while working** — toggle the working animation.
   - **Refresh interval** — 1 / 2.5 / 5 / 15 min.
   - **Notify me at** — set the *warning* (amber) and *critical* (red) percentages.
 - **Analysis** (📊) — toggle between *Today* and *This week* to see what's driving your usage.
+
+## Using it with Claude Desktop
+
+Claude Desktop keeps its own login and does not maintain the one in `~/.claude/.credentials.json`. If
+Desktop is the only way you use Claude, that login eventually lapses (its refresh token expires when it
+goes unused for long enough) and the widget has nothing to read usage with. The popup then shows a
+**Sign in** card instead of the bars, and the tray badge turns grey.
+
+Click **Sign in** once. It runs `claude auth login` with whichever Claude Code it finds — the CLI, or the
+engine Desktop itself downloaded — and from then on the widget renews the token on its own, so it keeps
+working with only Desktop open. Leave the widget running (or **Start with Windows**) so the login never
+goes long enough unused to lapse again.
 
 ## Build from source
 
@@ -139,7 +170,7 @@ src-tauri/target/release/bundle/nsis/Claude Usage Widget_<version>_x64-setup.exe
 ```
 src/                      React popup UI (App, components, hooks)
 src-tauri/src/
-  ├─ credentials.rs       read ~/.claude/.credentials.json
+  ├─ credentials.rs       read ~/.claude/.credentials.json, renew the token when it expires
   ├─ usage.rs             fetch + parse usage & profile
   ├─ analytics.rs         local, approximate usage attribution
   ├─ watcher.rs           process detection + "working" activity watcher
